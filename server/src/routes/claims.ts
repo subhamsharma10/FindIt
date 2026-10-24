@@ -1,0 +1,45 @@
+import { Router } from 'express';
+import { z } from 'zod';
+import Claim from '../models/Claim';
+import Item from '../models/Item';
+import { AuthRequest, requireAuth, requireAdmin } from '../middleware/auth';
+
+const router = Router();
+router.get('/mine', requireAuth, async (req: AuthRequest, res, next) => {
+  try {
+    const claims = await Claim.find({ claimant: req.user!.id }).sort({ createdAt: -1 }).populate('item');
+    res.json({ claims });
+  } catch (e) { next(e); }
+});
+router.get('/', requireAuth, requireAdmin, async (_req, res, next) => {
+  try {
+    const claims = await Claim.find().sort({ createdAt: -1 }).populate('item').populate('claimant', 'name email');
+    res.json({ claims });
+  } catch (e) { next(e); }
+});
+router.post('/', requireAuth, async (req: AuthRequest, res, next) => {
+  try {
+    const parsed = z.object({ itemId: z.string().min(1), message: z.string().trim().min(10).max(1000) }).safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ message: 'Provide the item and a claim message of at least 10 characters.' });
+    const item = await Item.findById(parsed.data.itemId);
+    if (!item || item.status === 'ARCHIVED' || item.status === 'RESOLVED') return res.status(404).json({ message: 'This item is not available for claims.' });
+    if (item.owner.toString() === req.user!.id) return res.status(400).json({ message: 'You cannot claim your own report.' });
+    const claim = await Claim.create({ item: item._id, claimant: req.user!.id, message: parsed.data.message });
+    item.status = 'CLAIM_PENDING'; await item.save();
+    res.status(201).json({ claim });
+  } catch (e: any) {
+    if (e?.code === 11000) return res.status(409).json({ message: 'You have already submitted a claim for this item.' });
+    next(e);
+  }
+});
+router.patch('/:id', requireAuth, requireAdmin, async (req: AuthRequest, res, next) => {
+  try {
+    const parsed = z.enum(['APPROVED', 'REJECTED']).safeParse(req.body.status);
+    if (!parsed.success) return res.status(400).json({ message: 'Invalid claim decision.' });
+    const claim = await Claim.findByIdAndUpdate(req.params.id, { status: parsed.data, reviewedBy: req.user!.id, reviewedAt: new Date() }, { new: true }).populate('item');
+    if (!claim) return res.status(404).json({ message: 'Claim not found.' });
+    if (parsed.data === 'APPROVED') await Item.findByIdAndUpdate((claim.item as any)._id, { status: 'RESOLVED' });
+    res.json({ claim });
+  } catch (e) { next(e); }
+});
+export default router;
